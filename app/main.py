@@ -137,7 +137,16 @@ from __future__ import annotations
 
 import re
 from fractions import Fraction
-from typing import Callable, Dict, List, Literal, Optional, Tuple
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Tuple,
+)
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -730,6 +739,127 @@ def build_tree_robdd(
     return sorted_events, bdd, top_node, node_map
 
 
+# ---- 观测类接口共用的读数校验与约束准备 ----
+# /v1/diagnose、/v1/inspect-next、/v1/likely-cause、/v1/observation-conflicts
+# 共用同一段准备过程：静态校验 → 观测键校验 → 在同一 ROBDD 中求值事件、
+# 门与未被 top 引用的观测/候选门 → 为每个读数准备约束节点。各接口在此
+# 之上保持原有条件含义：诊断与巡检按全部读数 E 计算，最可能原因按
+# top∧E 计算，冲突定位从读数子集枚举最小零概率组。
+
+
+class ObservationContext(NamedTuple):
+    """一次请求的共享 ROBDD 与观测约束准备结果。"""
+
+    sorted_events: List[str]  # 字典序事件 id
+    bdd: ROBDD  # 本请求的共享 ROBDD（同一唯一表）
+    top_node: int  # 顶事件节点
+    node_map: Dict[str, int]  # 事件与已建门（含观测/候选门）的节点表
+    obs_ids: List[str]  # 字典序观测 id
+    constraints: Dict[str, int]  # 观测 id → 约束节点（读 0 已取反）
+    prob_list: List[Fraction]  # 按 sorted_events 排列的事件先验
+
+
+def _validate_observation_keys(
+    observations: Dict[str, StrictBool], known_ids: "set[str]"
+) -> None:
+    """观测键必须指向已声明的事件或门（非法键多项时一并报错）。
+
+    门读数只是结构约束，不是相互独立的新事件，也不修改先验。
+    """
+    unknown = [k for k in observations if k not in known_ids]
+    if unknown:
+        raise ValueError(
+            "observations 引用了未声明的事件或门 id："
+            + ", ".join(repr(k) for k in unknown)
+        )
+
+
+def _validate_observation_request(
+    payload: AnalyzeRequest,
+) -> "tuple[Dict[str, Fraction], Dict[str, GateOp], Dict[str, List[str]], List[str]]":
+    """事件/门/top 静态校验加观测键校验。
+
+    返回 (事件概率表, 门算子表, 门输入表, 字典序事件 id 列表)。
+    """
+    probs, gate_ops, gate_inputs = _validate_payload(payload)
+    _validate_observation_keys(payload.observations, set(probs) | set(gate_ops))
+    return probs, gate_ops, gate_inputs, sorted(probs)
+
+
+def _build_observation_context(
+    probs: Dict[str, Fraction],
+    gate_ops: Dict[str, GateOp],
+    gate_inputs: Dict[str, List[str]],
+    top: str,
+    observations: Dict[str, StrictBool],
+    sorted_events: List[str],
+    extra_ids: Iterable[str] = (),
+) -> ObservationContext:
+    """在同一 ROBDD 中求值事件、门与观测/额外门，并准备各读数的约束节点。
+
+    未被 top 引用的观测门以及 extra_ids 中的额外门（如 /v1/inspect-next
+    的巡检候选门）也一并构建到同一唯一表中，按共享事件状态求值；累计
+    非终端节点仍受 MAX_NONTERMINAL_NODES 限制。每个读数的约束节点：
+    读 1 取节点本身，读 0 取其 BDD 取反；同一事件/门的多处引用共享
+    同一 BDD 节点，天然共享状态。
+    """
+    extra_gates = tuple(
+        k for k in list(observations) + list(extra_ids) if k in gate_ops
+    )
+    _, bdd, top_node, node_map = build_tree_robdd(
+        probs, gate_ops, gate_inputs, top, also=extra_gates
+    )
+
+    obs_ids = sorted(observations)
+    constraints = {
+        oid: (
+            node_map[oid] if observations[oid] else bdd.negate(node_map[oid])
+        )
+        for oid in obs_ids
+    }
+    return ObservationContext(
+        sorted_events=sorted_events,
+        bdd=bdd,
+        top_node=top_node,
+        node_map=node_map,
+        obs_ids=obs_ids,
+        constraints=constraints,
+        prob_list=[probs[eid] for eid in sorted_events],
+    )
+
+
+def _prepare_observation_context(
+    payload: AnalyzeRequest, extra_ids: Iterable[str] = ()
+) -> ObservationContext:
+    """读数校验与约束准备的一站式版本：校验 + 构建 + 约束节点。"""
+    probs, gate_ops, gate_inputs, sorted_events = _validate_observation_request(
+        payload
+    )
+    return _build_observation_context(
+        probs,
+        gate_ops,
+        gate_inputs,
+        payload.top,
+        payload.observations,
+        sorted_events,
+        extra_ids,
+    )
+
+
+def _conjoin_constraints(bdd: ROBDD, constraints: Iterable[int]) -> int:
+    """合取约束节点：结构上不可同时满足（合取恒为假）时短路返回终端 0。
+
+    合取结果是否为零概率（结构矛盾还是先验 0/1 造成）由调用方按各自
+    接口规则判定。
+    """
+    result = 1
+    for constraint in constraints:
+        result = bdd.and_(result, constraint)
+        if result == 0:
+            break
+    return result
+
+
 def analyze_logic(payload: AnalyzeRequest) -> AnalyzeResponse:
     probs, gate_ops, gate_inputs = _validate_payload(payload)
 
@@ -847,41 +977,11 @@ def repair_plan_logic(payload: RepairPlanRequest) -> RepairPlanResponse:
 
 
 def diagnose_logic(payload: DiagnoseRequest) -> DiagnoseResponse:
-    probs, gate_ops, gate_inputs = _validate_payload(payload)
-    sorted_events = sorted(probs)
+    # 诊断按全部读数 E 计算：E 为各观测约束在同一 ROBDD 上的合取
+    ctx = _prepare_observation_context(payload)
+    evidence = _conjoin_constraints(ctx.bdd, ctx.constraints.values())
 
-    # 观测键必须指向已声明的事件或门（门读数只是结构约束，不是相互
-    # 独立的新事件；非法键多项时一并报错）
-    known_ids = set(probs) | set(gate_ops)
-    unknown = [k for k in payload.observations if k not in known_ids]
-    if unknown:
-        raise ValueError(
-            "observations 引用了未声明的事件或门 id："
-            + ", ".join(repr(k) for k in unknown)
-        )
-
-    # 被观测的门（即便 top 不可达）也要构建到同一 ROBDD 中
-    observed_gates = tuple(
-        k for k in payload.observations if k in gate_ops
-    )
-    _, bdd, _, node_map = build_tree_robdd(
-        probs, gate_ops, gate_inputs, payload.top, also=observed_gates
-    )
-
-    # 在同一 ROBDD 上把各观测约束（node == 布尔读数）合取：
-    # 读 1 即门/事件本身，读 0 即其 BDD 取反；同一事件/门的多处
-    # 引用共享同一 BDD 节点，天然共享状态
-    evidence = 1
-    for obs_id, value in payload.observations.items():
-        lit = node_map[obs_id]
-        constraint = lit if value else bdd.negate(lit)
-        evidence = bdd.and_(evidence, constraint)
-        if evidence == 0:
-            # 短路：结构上已不可同时满足，无需继续合取
-            break
-
-    prob_list = [probs[eid] for eid in sorted_events]
-    evidence_prob, joint = bdd.joint_probabilities(evidence, prob_list)
+    evidence_prob, joint = ctx.bdd.joint_probabilities(evidence, ctx.prob_list)
 
     if evidence_prob == 0:
         if evidence == 0:
@@ -902,23 +1002,16 @@ def diagnose_logic(payload: DiagnoseRequest) -> DiagnoseResponse:
         evidence_probability=frac_string(evidence_prob),
         posteriors={
             eid: frac_string(joint[i] / evidence_prob)
-            for i, eid in enumerate(sorted_events)
+            for i, eid in enumerate(ctx.sorted_events)
         },
     )
 
 
 def inspect_next_logic(payload: InspectNextRequest) -> InspectNextResponse:
-    probs, gate_ops, gate_inputs = _validate_payload(payload)
-    sorted_events = sorted(probs)
+    probs, gate_ops, gate_inputs, sorted_events = _validate_observation_request(
+        payload
+    )
     known_ids = set(probs) | set(gate_ops)
-
-    # 观测键必须指向已声明的事件或门（同 /v1/diagnose）
-    unknown = [k for k in payload.observations if k not in known_ids]
-    if unknown:
-        raise ValueError(
-            "observations 引用了未声明的事件或门 id："
-            + ", ".join(repr(k) for k in unknown)
-        )
 
     # 候选校验：互异、已声明、未被观测；多项问题一并返回
     cand_errors: List[str] = []
@@ -954,27 +1047,22 @@ def inspect_next_logic(payload: InspectNextRequest) -> InspectNextResponse:
     if cand_errors:
         raise ValueError("；".join(cand_errors))
 
-    # 被观测/被候选的门（即便 top 不可达）也构建到同一 ROBDD 中
-    extra_gates = tuple(
-        k
-        for k in list(payload.observations) + list(dict.fromkeys(payload.candidates))
-        if k in gate_ops
+    # 巡检候选门（即便 top 不可达）也构建到同一 ROBDD 中参与分支计算
+    ctx = _build_observation_context(
+        probs,
+        gate_ops,
+        gate_inputs,
+        payload.top,
+        payload.observations,
+        sorted_events,
+        extra_ids=payload.candidates,
     )
-    _, bdd, top_node, node_map = build_tree_robdd(
-        probs, gate_ops, gate_inputs, payload.top, also=extra_gates
-    )
+    bdd = ctx.bdd
 
-    # 证据 E：各观测约束的合取（同 /v1/diagnose）
-    evidence = 1
-    for obs_id, value in payload.observations.items():
-        lit = node_map[obs_id]
-        constraint = lit if value else bdd.negate(lit)
-        evidence = bdd.and_(evidence, constraint)
-        if evidence == 0:
-            break
+    # 巡检按全部读数 E 计算：E 为各观测约束的合取（同 /v1/diagnose）
+    evidence = _conjoin_constraints(bdd, ctx.constraints.values())
 
-    prob_list = [probs[eid] for eid in sorted_events]
-    node_prob = bdd.node_probabilities(prob_list)
+    node_prob = bdd.node_probabilities(ctx.prob_list)
     evidence_prob = node_prob[evidence]
 
     if evidence_prob == 0:
@@ -993,13 +1081,13 @@ def inspect_next_logic(payload: InspectNextRequest) -> InspectNextResponse:
     #   E∧top、每个候选的 E∧X 与 E∧X∧top；
     # 假分支用减法精确得到：P(E∧¬X)=P(E)−P(E∧X)，
     #   P(E∧¬X∧top)=P(E∧top)−P(E∧X∧top)，无需再建取反合取
-    top_and_e = bdd.and_(top_node, evidence)
+    top_and_e = bdd.and_(ctx.top_node, evidence)
     branch_nodes: Dict[str, Tuple[int, int]] = {}
     for cid in dict.fromkeys(payload.candidates):
-        e_and_x = bdd.and_(evidence, node_map[cid])
-        e_and_x_top = bdd.and_(e_and_x, top_node)
+        e_and_x = bdd.and_(evidence, ctx.node_map[cid])
+        e_and_x_top = bdd.and_(e_and_x, ctx.top_node)
         branch_nodes[cid] = (e_and_x, e_and_x_top)
-    node_prob = bdd.node_probabilities(prob_list)
+    node_prob = bdd.node_probabilities(ctx.prob_list)
 
     top_and_e_prob = node_prob[top_and_e]
     q_e = top_and_e_prob / evidence_prob  # P(top|E)
@@ -1064,38 +1152,13 @@ def inspect_next_logic(payload: InspectNextRequest) -> InspectNextResponse:
 
 
 def likely_cause_logic(payload: LikelyCauseRequest) -> LikelyCauseResponse:
-    probs, gate_ops, gate_inputs = _validate_payload(payload)
-    sorted_events = sorted(probs)
+    # 最可能原因按 top∧E 计算：顶事件发生且全部读数成立（同一 ROBDD 上的合取）
+    ctx = _prepare_observation_context(payload)
+    bdd = ctx.bdd
+    evidence = _conjoin_constraints(bdd, ctx.constraints.values())
+    condition = bdd.and_(ctx.top_node, evidence)
 
-    # 观测键必须指向已声明的事件或门（同 /v1/diagnose）
-    known_ids = set(probs) | set(gate_ops)
-    unknown = [k for k in payload.observations if k not in known_ids]
-    if unknown:
-        raise ValueError(
-            "observations 引用了未声明的事件或门 id："
-            + ", ".join(repr(k) for k in unknown)
-        )
-
-    # 被观测的门（即便 top 不可达）也要构建到同一 ROBDD 中
-    observed_gates = tuple(
-        k for k in payload.observations if k in gate_ops
-    )
-    _, bdd, top_node, node_map = build_tree_robdd(
-        probs, gate_ops, gate_inputs, payload.top, also=observed_gates
-    )
-
-    # 条件 C：顶事件发生且全部读数成立（同一 ROBDD 上的合取）
-    condition = top_node
-    for obs_id, value in payload.observations.items():
-        lit = node_map[obs_id]
-        constraint = lit if value else bdd.negate(lit)
-        condition = bdd.and_(condition, constraint)
-        if condition == 0:
-            # 短路：结构上已不可同时满足，无需继续合取
-            break
-
-    prob_list = [probs[eid] for eid in sorted_events]
-    node_prob = bdd.node_probabilities(prob_list)
+    node_prob = bdd.node_probabilities(ctx.prob_list)
     condition_prob = node_prob[condition]
 
     if condition_prob == 0:
@@ -1115,7 +1178,7 @@ def likely_cause_logic(payload: LikelyCauseRequest) -> LikelyCauseResponse:
     # 在满足 C 的完整赋值中取独立先验乘积最大者（ROBDD 动态规划，
     # 不枚举事件状态）；未被结构约束的事件按自由变量取较可能一侧
     best_weight, assignment = most_likely_assignment(
-        bdd, condition, prob_list
+        bdd, condition, ctx.prob_list
     )
 
     def frac_string(value: Fraction) -> str:
@@ -1123,7 +1186,7 @@ def likely_cause_logic(payload: LikelyCauseRequest) -> LikelyCauseResponse:
 
     return LikelyCauseResponse(
         assignment={
-            eid: assignment[i] for i, eid in enumerate(sorted_events)
+            eid: assignment[i] for i, eid in enumerate(ctx.sorted_events)
         },
         condition_probability=frac_string(condition_prob),
         assignment_posterior=frac_string(best_weight / condition_prob),
@@ -1313,41 +1376,16 @@ def first_failure_time_logic(
 def observation_conflicts_logic(
     payload: ObservationConflictsRequest,
 ) -> ObservationConflictsResponse:
-    probs, gate_ops, gate_inputs = _validate_payload(payload)
-    sorted_events = sorted(probs)
-
-    # 观测键必须指向已声明的事件或门（同 /v1/diagnose）
-    known_ids = set(probs) | set(gate_ops)
-    unknown = [k for k in payload.observations if k not in known_ids]
-    if unknown:
-        raise ValueError(
-            "observations 引用了未声明的事件或门 id："
-            + ", ".join(repr(k) for k in unknown)
-        )
-
-    # 被观测的门（即便 top 不可达）也要构建到同一 ROBDD 中
-    observed_gates = tuple(
-        k for k in payload.observations if k in gate_ops
-    )
-    _, bdd, _, node_map = build_tree_robdd(
-        probs, gate_ops, gate_inputs, payload.top, also=observed_gates
-    )
-
-    # 观测按 id 字典序排列；读 1 取节点本身，读 0 取其 BDD 取反，
-    # 同一事件/门的多处引用共享同一 BDD 节点，天然共享状态
-    obs_ids = sorted(payload.observations)
-    constraints = [
-        node_map[oid] if payload.observations[oid] else bdd.negate(node_map[oid])
-        for oid in obs_ids
-    ]
-
-    prob_list = [probs[eid] for eid in sorted_events]
-    groups = minimal_zero_prob_groups(bdd, constraints, prob_list)
+    # 冲突定位从读数子集找最小零概率组：各读数的约束节点不预先整体
+    # 合取，完整 E 为假时仍由 minimal_zero_prob_groups 枚举全部子集
+    ctx = _prepare_observation_context(payload)
+    constraints = [ctx.constraints[oid] for oid in ctx.obs_ids]
+    groups = minimal_zero_prob_groups(ctx.bdd, constraints, ctx.prob_list)
 
     # 位掩码展开为观测 id 列表（下标序即 id 字典序，组内天然有序）；
     # 组间先按组长度、再按 id 序列字典序排序
     conflicts = [
-        [obs_ids[i] for i in range(len(obs_ids)) if mask >> i & 1]
+        [ctx.obs_ids[i] for i in range(len(ctx.obs_ids)) if mask >> i & 1]
         for mask in groups
     ]
     conflicts.sort(key=lambda ids: (len(ids), ids))
